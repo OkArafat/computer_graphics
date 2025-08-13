@@ -4,19 +4,14 @@ from OpenGL.GL import *
 from OpenGL.GLUT import *
 from OpenGL.GLU import *
 
-# This code was written by [Arafat Haque ] for CSE423.
-# The house has a custom purple roof, a blue door, and a chimney.
-# Rain direction and day/night cycle are interactive.
-# FIXED: Rain physics and distribution for better visuals
-
 # Window size
 WIDTH, HEIGHT = 800, 600
 
-# Rain parameters - IMPROVED
-NUM_DROPS = 1200  # Optimized for better performance
-RAIN_LENGTH = 20  # Longer drops for better visibility
-RAIN_SPEED = 5    # Balanced speed
-RAIN_BEND_STEP = 0.3  # Smoother direction changes
+
+NUM_DROPS = 1200  
+RAIN_LENGTH = 20  
+RAIN_SPEED = 5    
+RAIN_BEND_STEP = 0.3  
 
 # Day/Night parameters
 BG_BRIGHTNESS_STEP = 0.01
@@ -34,17 +29,14 @@ def init_rain():
     global rain_drops
     rain_drops = []
     
-    # Calculate proper coverage area based on rain angle
     x_offset = abs(rain_dx) * HEIGHT
     x_min = -x_offset - 100  # Extra buffer for smooth edges
     x_max = WIDTH + x_offset + 100
-    
-    # Generate rain drops with proper distribution
+
     for _ in range(NUM_DROPS):
         x = random.uniform(x_min, x_max)
-        y = random.uniform(0, HEIGHT + 150)  # Start some drops above screen
-        
-        # Add variation for more natural look
+        y = random.uniform(0, HEIGHT + 150) 
+      
         life = random.uniform(0.7, 1.0)  # Drop opacity
         speed_var = random.uniform(0.9, 1.1)  # Speed variation
         
@@ -109,17 +101,7 @@ def draw_house():
     glVertex2f(house_left + house_width, house_bottom + 85)
     glVertex2f(house_left, house_bottom + 85)
     glEnd()
-    
-    # Shadow/depth
-    glColor3f(0.0, 0.0, 0.0)
-    glBegin(GL_TRIANGLES)
-    glVertex2f(house_left + 20, house_bottom + 83)
-    glVertex2f(house_left + house_width - 20, house_bottom + 83)
-    glVertex2f(house_left + house_width - 20, house_bottom + 85)
-    glVertex2f(house_left + 20, house_bottom + 83)
-    glVertex2f(house_left + house_width - 20, house_bottom + 85)
-    glVertex2f(house_left + 20, house_bottom + 85)
-    glEnd()
+
     
     # Second floor
     glColor3f(0.85, 0.78, 0.68)
@@ -216,14 +198,12 @@ def draw_rain():
     for drop in rain_drops:
         x, y, life, speed_var = drop
         
-        # Light blue rain color
+       
         rain_r, rain_g, rain_b = 0.6, 0.8, 1.0
-        
-        # Alpha based on life - creates fading effect
+   
         alpha = life * max(0.3, 1.0 - (HEIGHT - y) / HEIGHT)
         glColor4f(rain_r, rain_g, rain_b, alpha)
         
-        # Draw the rain drop
         glVertex2f(x, y)
         glVertex2f(x + rain_dx * RAIN_LENGTH, y - RAIN_LENGTH)
     
@@ -237,20 +217,18 @@ def update_rain():
     for drop in rain_drops:
         x, y, life, speed_var = drop
         
-        # Move the drop
+
         drop[0] += rain_dx * RAIN_SPEED * speed_var
         drop[1] -= RAIN_SPEED * speed_var
-        
-        # Gradually fade the drop
+      
         drop[2] *= 0.9995
         
-        # Reset if off screen or too faded
         if (drop[1] < -RAIN_LENGTH or 
             drop[0] < -RAIN_LENGTH * abs(rain_dx) - 150 or 
             drop[0] > WIDTH + RAIN_LENGTH * abs(rain_dx) + 150 or
             drop[2] < 0.1):
             
-            # Respawn at top with new random position
+          
             x_offset = abs(rain_dx) * HEIGHT
             drop[0] = random.uniform(-x_offset - 100, WIDTH + x_offset + 100)
             drop[1] = HEIGHT + random.uniform(0, 150)
@@ -294,11 +272,11 @@ def keyboard(key, x, y):
     global target_brightness
     key = key.decode('utf-8')
     
-    if key == 'n':  # Night mode
+    if key == 'n':  
         target_brightness = BG_BRIGHTNESS_MIN
-    elif key == 's':  # Day mode
+    elif key == 's':  
         target_brightness = BG_BRIGHTNESS_MAX
-    elif key == 'q':  # Quit
+   
         sys.exit()
 
 def reset_rain_positions():
@@ -308,7 +286,7 @@ def reset_rain_positions():
     x_min = -x_offset - 100
     x_max = WIDTH + x_offset + 100
     
-    # Reset all drops to new positions
+ 
     for drop in rain_drops:
         drop[0] = random.uniform(x_min, x_max)
         drop[1] = random.uniform(0, HEIGHT + 150)
@@ -342,7 +320,7 @@ def main():
     glutInitWindowSize(WIDTH, HEIGHT)
     glutCreateWindow(b"Rain Direction and Day/Night Simulation - FIXED")
     
-    # Enable blending for better rain effects
+ 
     glEnable(GL_BLEND)
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
     
