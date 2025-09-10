@@ -7,6 +7,69 @@ import time
 import math
 
 
+
+def _init_rain_pool():
+	global raindrops
+	raindrops = []
+	# Spawn across visible sky footprint
+	rng = random.Random(7777)
+	count = min(RAIN_POOL_CAP, rain_num_drops)
+	for _ in range(count):
+		x = rng.uniform(RAIN_X_RANGE[0], RAIN_X_RANGE[1])
+		y = rng.uniform(starfield_bounds["y"][1]-0.2, starfield_bounds["y"][1]+0.8)
+		z = rng.uniform(RAIN_Z_FAR, -RAIN_Z_NEAR)
+		spd = RAIN_SPEED + rng.uniform(-RAIN_SPEED_VAR, RAIN_SPEED_VAR)
+		vx = RAIN_DX * (0.6 + rng.random()*0.8)
+		vy = -abs(spd)
+		vz = 0.0
+		length = RAIN_LENGTH * (0.8 + rng.random()*0.6)
+		raindrops.append({"pos": [x, y, z], "vel": [vx, vy, vz], "len": length, "alive": True, "splash": 0.0})
+
+
+def _respawn_drop(r):
+	# Recycle above the sky with randomized horizontal position and speed
+	rng = random.Random((id(r) ^ int(time.time()*1000)) & 0xffffffff)
+	r["pos"][0] = rng.uniform(RAIN_X_RANGE[0], RAIN_X_RANGE[1])
+	r["pos"][1] = rng.uniform(starfield_bounds["y"][1]-0.2, starfield_bounds["y"][1]+0.8)
+	r["pos"][2] = rng.uniform(RAIN_Z_FAR, -RAIN_Z_NEAR)
+	spd = RAIN_SPEED + rng.uniform(-RAIN_SPEED_VAR, RAIN_SPEED_VAR)
+	r["vel"][0] = RAIN_DX * (0.6 + rng.random()*0.8)
+	r["vel"][1] = -abs(spd)
+	r["vel"][2] = 0.0
+	r["len"] = RAIN_LENGTH * (0.8 + rng.random()*0.6)
+	r["alive"] = True
+	r["splash"] = 0.0
+
+
+def _update_rain(dt):
+	global raindrops
+	if not raindrops:
+		return
+	for r in raindrops:
+		if not r["alive"]:
+			# Splash fade
+			r["splash"] -= dt * 6.0
+			if r["splash"] <= 0.0:
+				_respawn_drop(r)
+			continue
+		# Integrate motion
+		r["pos"][0] += r["vel"][0] * dt
+		r["pos"][1] += r["vel"][1] * dt
+		r["pos"][2] += r["vel"][2] * dt
+		# Ground hit
+		if r["pos"][1] <= GROUND_Y + 0.02:
+			r["alive"] = False
+			r["splash"] = 1.0
+			# clamp to ground for splash rendering
+			r["pos"][1] = GROUND_Y + 0.02
+		# Wrap X outside frustum bounds to keep coverage
+		if r["pos"][0] < RAIN_X_RANGE[0]-1.0:
+			r["pos"][0] = RAIN_X_RANGE[1]
+		elif r["pos"][0] > RAIN_X_RANGE[1]+1.0:
+			r["pos"][0] = RAIN_X_RANGE[0]
+
+
+
 # Window
 width, height = 900, 600
 
@@ -61,6 +124,14 @@ orb_spawn_max_gap = 24.0
 car_fire_particles = []  # list of particles: {pos:[x,y,z], vel:[vx,vy,vz], life:float, color:(r,g,b), size:float}
 car_fire_max_life = 0.9
 
+# Bullets and wall debris
+bullets = []  # list of dicts {lane:int, side:str, z:float, speed:float, alive:bool}
+bullet_speed = 28.0
+bullet_cooldown = 0.20
+_last_bullet_time = 0.0
+wall_debris = []  # list of dicts {pos:[x,y,z], vel:[vx,vy,vz], life:float, size:float}
+wall_debris_max_life = 0.8
+
 # Cheat mode
 cheat_active = False
 cheat_until_ts = 0.0
@@ -76,6 +147,318 @@ selection_window_id = None
 main_window_id = None
 selection_window_w = 1200
 selection_window_h = 500
+
+# Occasion system (sky/atmosphere overlays; independent of base theme)
+# None | 'night' | 'day' | 'night_rain' | 'day_rain' | 'ufo'
+current_occasion = None
+
+# Celestials (Sun, Moon, Stars, Comets)
+# Colors from hex aesthetic palette
+def _hex_to_rgb(hex_str):
+	"""Convert '#RRGGBB' to tuple of floats 0..1."""
+	hex_str = hex_str.strip().lstrip('#')
+	r = int(hex_str[0:2], 16) / 255.0
+	g = int(hex_str[2:4], 16) / 255.0
+	b = int(hex_str[4:6], 16) / 255.0
+	return (r, g, b)
+
+# Base palette
+_SUN_COLOR = _hex_to_rgb('#FFD93D')
+_MOON_COLOR = _hex_to_rgb('#CFCFCF')
+_STAR_COLOR = _hex_to_rgb('#E0FFFF')
+_COMET_TAIL_COLOR = _hex_to_rgb('#FF6F61')
+
+# Celestial state
+celestial_fade = 0.0			# 0..1 visible intensity based on theme
+celestial_target_fade = 0.0
+celestial_fade_speed = 1.6	# per second
+
+stars = []					# list of dicts: {pos:(x,y,z), size:float, phase:float}
+num_stars_base = 140
+num_stars_space = 420
+# Unified sky ranges (cover full frustum)
+SKY_X_RANGE = (-18.0, 18.0)
+SKY_Y_RANGE = (2.5, 8.0)
+SKY_Z_RANGE = (-40.0, -220.0)
+starfield_bounds = {
+	"x": SKY_X_RANGE,
+	"y": SKY_Y_RANGE,
+	"z": SKY_Z_RANGE,
+}
+twinkle_speed = 1.6
+twinkle_multiplier = 1.0
+
+comets = []					# list of dicts: {pos:[x,y,z], vel:[vx,vy,vz], tail:[{pos, life}], life:float}
+comet_spawn_timer = 0.0
+comet_spawn_cooldown = (8.0, 16.0)
+comet_spawn_next = 10.0
+comet_head_radius = 0.15
+comet_tail_max = 40
+
+# Active palette (can be overridden by occasion themes)
+celestial_palette = {
+	"sun": _SUN_COLOR,
+	"moon": _MOON_COLOR,
+	"stars": _STAR_COLOR,
+	"comet_tail": _COMET_TAIL_COLOR,
+}
+
+# Clouds/Rain/UFO state
+clouds = []  # list of dicts {pos:[x,y,z], size:float, speed:float, alpha:float}
+raindrops = []  # list of dicts {pos:[x,y,z], vel:[vx,vy,vz], life:float}
+ufos = []  # list of dicts {pos:[x,y,z], vel:[vx,vy,vz], wobble:float, phase:float}
+rain_spawn_accum = 0.0
+ufo_spawn_timer = 0.0
+ufo_spawn_next = 12.0
+
+# Rain physics (3D-adapted from Arafat's 2D implementation)
+NUM_DROPS_DEFAULT = 1200
+RAIN_LENGTH = 0.65
+RAIN_SPEED = 14.0
+RAIN_SPEED_VAR = 6.0
+RAIN_DX = -1.2  # diagonal wind drift along X
+GROUND_Y = -1.0  # ground plane matches ground quad
+RAIN_POOL_CAP = 2000
+rain_num_drops = NUM_DROPS_DEFAULT
+RAIN_X_RANGE = (-16.0, 16.0)
+RAIN_Z_NEAR = 6.0
+RAIN_Z_FAR = -180.0
+
+
+def _theme_celestial_flags():
+	"""Decide which celestial elements should be visible for the current theme.
+	This is intentionally simple and extendable. Add more themes/occasions later.
+	"""
+	# Built-in main themes
+	is_space = (current_theme == 'space')
+	is_city = (current_theme == 'city')
+	is_jungle = (current_theme == 'jungle')
+	flags = {
+		# Sun shows only in city; Jungle uses moon instead; Space uses stars
+		"sun": bool(is_city and not is_space),
+		"moon": bool(is_jungle and not is_space),
+		"stars": bool(is_space),
+		"comets": bool(is_space),
+		"dense_starfield": bool(is_space),
+		"sun_color": _SUN_COLOR,
+		"moon_color": _MOON_COLOR,
+		"star_color": _STAR_COLOR,
+		"comet_tail_color": _COMET_TAIL_COLOR,
+		"twinkle_mul": 1.0,
+		"comet_rate": "normal",  # normal|dense|rare
+		# Space should not allow rain
+		"allow_rain": (current_theme != 'space'),
+	}
+
+	# Occasion overlays (do NOT change ground). Merge on top of base flags
+	if current_occasion == 'day':
+		flags.update({"sun": True, "moon": False, "stars": False, "comets": False, "dense_starfield": False, "twinkle_mul": 0.8})
+	elif current_occasion == 'night':
+		flags.update({"sun": False, "moon": True, "stars": True, "comets": False, "dense_starfield": False, "twinkle_mul": 1.0})
+	elif current_occasion == 'night_rain':
+		flags.update({"sun": False, "moon": True, "stars": True, "comets": False, "dense_starfield": False, "twinkle_mul": 1.0})
+	elif current_occasion == 'day_rain':
+		flags.update({"sun": True, "moon": False, "stars": False, "comets": False, "dense_starfield": False, "twinkle_mul": 0.8})
+	elif current_occasion == 'ufo':
+		# Keep base theme; add UFO accompaniment; enable stars unless sun is showing
+		is_daytime = flags.get("sun", False)
+		flags.update({"stars": flags["stars"] or (not is_daytime), "comets": flags["comets"], "dense_starfield": flags["dense_starfield"] or is_space, "twinkle_mul": 1.2 if not is_daytime else 0.8})
+
+	return flags
+
+
+def _regen_stars(dense=False):
+	global stars
+	stars = []
+	count = num_stars_space if dense else num_stars_base
+	rng = random.Random(1337)
+	for _ in range(count):
+		x = rng.uniform(SKY_X_RANGE[0], SKY_X_RANGE[1])
+		y = rng.uniform(SKY_Y_RANGE[0], SKY_Y_RANGE[1])
+		z = rng.uniform(SKY_Z_RANGE[0], SKY_Z_RANGE[1])
+		size = rng.uniform(0.008, 0.020) * (1.6 if dense else 1.0)
+		phase = rng.uniform(0.0, 6.28318)
+		stars.append({"pos": (x, y, z), "size": size, "phase": phase})
+
+
+def init_celestials_for_theme():
+	"""Initialize starfield density, fade target, and comet timers for current theme."""
+	global celestial_target_fade, comet_spawn_timer, comet_spawn_next, comets, celestial_palette, twinkle_multiplier, _SUN_COLOR, _MOON_COLOR, _STAR_COLOR, _COMET_TAIL_COLOR, clouds, raindrops, ufos, rain_spawn_accum, ufo_spawn_timer, ufo_spawn_next
+	flags = _theme_celestial_flags()
+	_regen_stars(dense=flags["dense_starfield"])
+	comets = []
+	comet_spawn_timer = 0.0
+	# Twinkle multiplier
+	twinkle_multiplier = max(0.2, float(flags.get("twinkle_mul", 1.0)))
+	# Palette overrides
+	celestial_palette = {
+		"sun": flags.get("sun_color", _SUN_COLOR),
+		"moon": flags.get("moon_color", _MOON_COLOR),
+		"stars": flags.get("star_color", _STAR_COLOR),
+		"comet_tail": flags.get("comet_tail_color", _COMET_TAIL_COLOR),
+	}
+	# Comet spawn rate
+	if flags["dense_starfield"] or flags.get("comet_rate") == "dense":
+		min_cd, max_cd = (3.0, 7.0)
+	elif flags.get("comet_rate") == "rare":
+		min_cd, max_cd = (10.0, 18.0)
+	else:
+		min_cd, max_cd = comet_spawn_cooldown
+	comet_spawn_next = random.uniform(min_cd, max_cd)
+	celestial_target_fade = 1.0 if (flags["sun"] or flags["moon"] or flags["stars"] or flags["comets"]) else 0.0
+
+	# Initialize clouds/rain/UFO state per occasion
+	clouds = []
+	raindrops = []
+	rain_spawn_accum = 0.0
+	ufos = []
+	ufo_spawn_timer = 0.0
+	ufo_spawn_next = random.uniform(8.0, 14.0)
+	if current_occasion in ('day', 'day_rain'):
+		# seed a few clouds
+		rng = random.Random(4242)
+		for _ in range(24):
+			x = rng.uniform(starfield_bounds["x"][0], starfield_bounds["x"][1])
+			y = rng.uniform(3.6, 6.5)
+			z = rng.uniform(-70.0, -130.0)
+			sz = rng.uniform(0.8, 1.8)
+			spd = rng.uniform(0.25, 0.55)
+			clouds.append({"pos": [x, y, z], "size": sz, "speed": spd, "alpha": 0.6, "phase": rng.uniform(0.0, 6.28)})
+	if current_occasion == 'ufo':
+		# seed some ufos initially
+		rng = random.Random(5252)
+		for _ in range(10):
+			x = rng.uniform(SKY_X_RANGE[0], SKY_X_RANGE[1])
+			y = rng.uniform(3.0, 6.8)
+			z = rng.uniform(SKY_Z_RANGE[0]*0.6, SKY_Z_RANGE[1]*0.6)
+			vx = rng.uniform(-2.5, 2.5)
+			if abs(vx) < 0.8:
+				vx = 1.2 if (rng.random()<0.5) else -1.2
+			ufos.append({"pos": [x, y, z], "vel": [vx, 0.0, 0.0], "wobble": 0.0, "phase": rng.uniform(0.0, 6.28)})
+	# Initialize rain pool if raining and theme allows rain
+	if current_occasion in ('day_rain', 'night_rain') and flags.get("allow_rain", True):
+		_init_rain_pool()
+
+
+def update_celestials(dt, now):
+	"""Update fade, twinkle, and comet motion/spawn each frame."""
+	global celestial_fade, comet_spawn_timer, comet_spawn_next, comets
+	# Fade toward target
+	if celestial_fade < celestial_target_fade:
+		celestial_fade = min(celestial_target_fade, celestial_fade + celestial_fade_speed * dt)
+	elif celestial_fade > celestial_target_fade:
+		celestial_fade = max(celestial_target_fade, celestial_fade - celestial_fade_speed * dt)
+	# Twinkle
+	if stars:
+		for s in stars:
+			s["phase"] += (twinkle_speed * twinkle_multiplier) * dt
+	# Comets
+	flags = _theme_celestial_flags()
+	# Move and age tails
+	if comets:
+		for c in comets:
+			c["pos"][0] += c["vel"][0] * dt
+			c["pos"][1] += c["vel"][1] * dt
+			c["pos"][2] += c["vel"][2] * dt
+			# grow tail
+			c.setdefault("tail", []).append({"pos": tuple(c["pos"]), "life": 1.0})
+			for seg in c["tail"]:
+				seg["life"] -= dt * 1.8
+		# cull finished
+		alive = []
+		for c in comets:
+			px, py, pz = c["pos"]
+			if px < starfield_bounds["x"][0]-2 or px > starfield_bounds["x"][1]+2 or \
+			   py < 1.0 or py > starfield_bounds["y"][1]+2 or \
+			   pz > -10.0 or pz < starfield_bounds["z"][1]-20:
+				continue
+			c["tail"] = [seg for seg in c.get("tail", []) if seg["life"] > 0]
+			alive.append(c)
+		comets = alive
+	# Spawn new comets
+	comet_spawn_timer += dt
+	if flags["comets"] and comet_spawn_timer >= comet_spawn_next:
+		comet_spawn_timer = 0.0
+		min_cd, max_cd = (2.0, 5.0) if flags["dense_starfield"] else comet_spawn_cooldown
+		comet_spawn_next = random.uniform(min_cd, max_cd)
+		# Spawn from wider sky: random side and altitude within sky ranges
+		from_left = (random.random() < 0.5)
+		start_x = SKY_X_RANGE[0]-2.0 if from_left else SKY_X_RANGE[1]+2.0
+		start_y = random.uniform(SKY_Y_RANGE[1]-1.0, SKY_Y_RANGE[1])
+		start_z = random.uniform(SKY_Z_RANGE[0]*0.7, SKY_Z_RANGE[1]*0.7)
+		speed = random.uniform(8.0, 14.0) * (1.4 if flags["dense_starfield"] else 1.0)
+		vx = speed * (0.6 if from_left else -0.6)
+		vy = -speed * 0.35
+		vz = speed * 0.15
+		comets.append({"pos": [start_x, start_y, start_z], "vel": [vx, vy, vz], "tail": [], "life": 1.0})
+
+	# Rain particles for rain occasions
+	flags_now = _theme_celestial_flags()
+	if current_occasion in ('day_rain', 'night_rain') and flags_now.get("allow_rain", True):
+		_update_rain(dt)
+
+	# UFO spawns for UFO occasion
+	if current_occasion == 'ufo':
+		_update_ufos(dt)
+
+	# Clouds drift for day/day_rain
+	if current_occasion in ('day', 'day_rain') and clouds:
+		for c in clouds:
+			c["pos"][0] += c.get("speed", 0.4) * dt
+			c["phase"] = c.get("phase", 0.0) + 0.5 * dt
+			if c["pos"][0] > SKY_X_RANGE[1] + 1.0:
+				c["pos"][0] = SKY_X_RANGE[0] - 1.0
+
+
+def _spawn_and_update_rain(dt):
+	global raindrops, rain_spawn_accum
+	# Spawn rate scales with width of sky
+	rain_spawn_accum += dt
+	spawn_rate = 80.0  # drops per second baseline
+	to_spawn = int(rain_spawn_accum * spawn_rate)
+	if to_spawn > 0:
+		rain_spawn_accum -= to_spawn / spawn_rate
+		rng = random.Random(int(time.time()*1000) & 0xffffffff)
+		for _ in range(to_spawn):
+			x = rng.uniform(starfield_bounds["x"][0], starfield_bounds["x"][1])
+			y = rng.uniform(starfield_bounds["y"][1]-0.2, starfield_bounds["y"][1]+0.5)
+			z = rng.uniform(-70.0, -130.0)
+			vx = rng.uniform(-0.5, 0.2)
+			vy = -rng.uniform(10.0, 16.0)
+			vz = 0.0
+			raindrops.append({"pos": [x, y, z], "vel": [vx, vy, vz], "life": 2.5})
+	# Integrate
+	for r in raindrops:
+		r["pos"][0] += r["vel"][0] * dt
+		r["pos"][1] += r["vel"][1] * dt
+		r["pos"][2] += r["vel"][2] * dt
+		r["life"] -= dt
+	# Cull
+	raindrops = [r for r in raindrops if r["life"] > 0 and r["pos"][1] > 1.2]
+
+
+def _update_ufos(dt):
+	global ufos, ufo_spawn_timer, ufo_spawn_next
+	ufo_spawn_timer += dt
+	if ufo_spawn_timer >= ufo_spawn_next:
+		ufo_spawn_timer = 0.0
+		ufo_spawn_next = random.uniform(6.0, 12.0)
+		# Spawn from left or right randomly
+		from_left = (random.random() < 0.5)
+		x = starfield_bounds["x"][0]-1.5 if from_left else starfield_bounds["x"][1]+1.5
+		y = random.uniform(3.2, 6.2)
+		z = random.uniform(-75.0, -110.0)
+		s = random.uniform(1.6, 2.4)
+		vx = s * (1.0 if from_left else -1.0)
+		vy = 0.0
+		vz = 0.0
+		ufos.append({"pos": [x, y, z], "vel": [vx, vy, vz], "wobble": 0.0, "phase": random.uniform(0.0, 6.28)})
+	# Move and cull
+	for u in ufos:
+		u["pos"][0] += u["vel"][0] * dt
+		u["phase"] += dt
+	# keep on screen bounds
+	ufos = [u for u in ufos if starfield_bounds["x"][0]-2.0 <= u["pos"][0] <= starfield_bounds["x"][1]+2.0]
 
 def get_theme_def():
 	# Return dict of theme parameters
@@ -120,6 +503,36 @@ def choose_by_weights(pairs):
 		if r <= acc:
 			return v
 	return pairs[-1][0]
+
+
+def fire_bullet():
+	global _last_bullet_time, bullets
+	now_ts = time.time()
+	if now_ts - _last_bullet_time >= bullet_cooldown:
+		_last_bullet_time = now_ts
+		bullets.append({
+			"lane": current_lane_index,
+			"side": current_surface,
+			"z": player_z_offset - 0.2,
+			"speed": bullet_speed,
+			"alive": True,
+		})
+
+
+def spawn_wall_debris(x, y, z):
+	# Spawn small chunk particles when a wall breaks
+	rng = random.Random(hash((int(time.time()*1000), int(x*10), int(z*10))) & 0xffffffff)
+	for _ in range(14):
+		vx = rng.uniform(-1.2, 1.2)
+		vz = rng.uniform(-0.8, 0.8)
+		vy = rng.uniform(1.2, 2.4) * (1.0 if current_surface == "Ceiling" else -1.0)
+		size = rng.uniform(0.08, 0.16)
+		wall_debris.append({
+			"pos": [x + rng.uniform(-0.3, 0.3), y + (0.2 if current_surface == "Floor" else -0.2), z + rng.uniform(-0.2, 0.2)],
+			"vel": [vx, vy, vz],
+			"life": wall_debris_max_life,
+			"size": size,
+		})
 
 
 # --- Selection UI helpers ---
@@ -354,6 +767,8 @@ def reset_game():
 	current_difficulty_mode = "EASY"
 	spawn_cap_per_frame = 1
 	glutPostRedisplay()
+	# Refresh celestials after resetting systems
+	init_celestials_for_theme()
 
 
 def seed_initial_obstacles():
@@ -395,7 +810,7 @@ def seed_initial_obstacles():
 
 
 def seed_initial_platforms():
-	# Start with a few platforms staggered ahead on both sides
+    	# Start with a few platforms staggered ahead on both sides
 	acc = 10.0
 	for _ in range(10):
 		lane = random.randint(0, 2)
@@ -419,6 +834,8 @@ def init():
 
 	glMatrixMode(GL_MODELVIEW)
 	glLoadIdentity()
+	# Initialize celestial state for current theme
+	init_celestials_for_theme()
 
 
 
@@ -525,6 +942,224 @@ def draw_cube(size):
 	glVertex3f(-s, s, -s)
 	glVertex3f(-s, -s, -s)
 	glEnd()
+
+
+# -------------------- Celestial Drawing --------------------
+def _sky_push_camera():
+	"""Place drawing far away so it sits behind gameplay. Keep current camera/roll."""
+	# We rely on current camera + roll already set in display(); just ensure depth writes minimal.
+	glDisable(GL_LIGHTING)
+	glDepthMask(GL_TRUE)
+
+def draw_stars():
+	if celestial_fade <= 0.01 or not stars:
+		return
+	_sky_push_camera()
+	# Soft additive-like draw: enable blending
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+	for s in stars:
+		x, y, z = s["pos"]
+		sz = s["size"]
+		phase = s["phase"]
+		alpha = 0.3 + 0.7 * abs(math.sin(phase))
+		alpha *= celestial_fade
+		glColor4f(celestial_palette["stars"][0], celestial_palette["stars"][1], celestial_palette["stars"][2], alpha)
+		glPushMatrix()
+		glTranslatef(x, y, z)
+		# Render tiny billboard quad (screen-facing approximation)
+		s = sz
+		glBegin(GL_QUADS)
+		glVertex3f(-s, -s, 0)
+		glVertex3f(s, -s, 0)
+		glVertex3f(s, s, 0)
+		glVertex3f(-s, s, 0)
+		glEnd()
+		glPopMatrix()
+	glDisable(GL_BLEND)
+
+
+def draw_sun():
+	if celestial_fade <= 0.01:
+		return
+	_sky_push_camera()
+	# Fixed position in sky hemisphere for day themes
+	glPushMatrix()
+	# Place within frustum top band
+	x = (SKY_X_RANGE[0]*0.35)
+	y = SKY_Y_RANGE[1] - 1.0
+	z = (SKY_Z_RANGE[0]+SKY_Z_RANGE[1]) * 0.5
+	glTranslatef(x, y, z)
+	glColor4f(celestial_palette["sun"][0], celestial_palette["sun"][1], celestial_palette["sun"][2], 1.0 * celestial_fade)
+	glutSolidSphere(0.9, 22, 18)
+	# Glow halo quad
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+	glColor4f(celestial_palette["sun"][0], celestial_palette["sun"][1], celestial_palette["sun"][2], 0.27 * celestial_fade)
+	glBegin(GL_QUADS)
+	glVertex3f(-1.8, -1.8, 0.0)
+	glVertex3f(1.8, -1.8, 0.0)
+	glVertex3f(1.8, 1.8, 0.0)
+	glVertex3f(-1.8, 1.8, 0.0)
+	glEnd()
+	glDisable(GL_BLEND)
+	glPopMatrix()
+
+
+def draw_moon():
+	if celestial_fade <= 0.01:
+		return
+	_sky_push_camera()
+	glPushMatrix()
+	# Place within frustum top band opposite the sun
+	x = (SKY_X_RANGE[1]*0.35)
+	y = SKY_Y_RANGE[1] - 1.2
+	z = (SKY_Z_RANGE[0]+SKY_Z_RANGE[1]) * 0.45
+	glTranslatef(x, y, z)
+	glColor4f(celestial_palette["moon"][0], celestial_palette["moon"][1], celestial_palette["moon"][2], 1.0 * celestial_fade)
+	glutSolidSphere(0.8, 20, 16)
+	# Subtle craterish shading via overlay quads
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+	glColor4f(0.85, 0.85, 0.85, 0.25 * celestial_fade)
+	for ox, oy, r in ((-0.2, 0.15, 0.35), (0.25, -0.1, 0.28), (0.1, 0.25, 0.22)):
+		glPushMatrix()
+		glTranslatef(ox, oy, 0.4)
+		glScalef(r, r, r)
+		glBegin(GL_QUADS)
+		glVertex3f(-1, -1, 0)
+		glVertex3f(1, -1, 0)
+		glVertex3f(1, 1, 0)
+		glVertex3f(-1, 1, 0)
+		glEnd()
+		glPopMatrix()
+	glDisable(GL_BLEND)
+	glPopMatrix()
+
+
+def draw_clouds():
+	if celestial_fade <= 0.01 or not clouds:
+		return
+	_sky_push_camera()
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+	for c in clouds:
+		x, y, z = c["pos"]
+		sz = c["size"]
+		alpha = min(0.8, 0.45 + 0.35 * (1.0 - abs(math.sin(c.get("phase", 0.0))))) * celestial_fade
+		glColor4f(0.95, 0.97, 1.0, alpha)
+		glPushMatrix()
+		glTranslatef(x, y, z)
+		glScalef(sz*2.0, sz*0.8, 1.0)
+		glBegin(GL_QUADS)
+		glVertex3f(-1, -0.6, 0)
+		glVertex3f(1, -0.6, 0)
+		glVertex3f(1, 0.6, 0)
+		glVertex3f(-1, 0.6, 0)
+		glEnd()
+		glPopMatrix()
+	glDisable(GL_BLEND)
+
+
+def draw_rain():
+	if celestial_fade <= 0.01 or not raindrops:
+		return
+	_sky_push_camera()
+	# Rain should appear after clouds but before comets/UFOs; blending on
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA)
+	# Draw falling drops
+	glColor4f(0.8, 0.9, 1.0, 0.7 * celestial_fade)
+	glBegin(GL_LINES)
+	for r in raindrops:
+		if not r.get("alive", True):
+			continue
+		x, y, z = r["pos"]
+		vx, vy, vz = r["vel"]
+		length = r.get("len", RAIN_LENGTH)
+		lx = vx / max(1e-6, math.sqrt(vx*vx + vy*vy + vz*vz)) * length
+		ly = vy / max(1e-6, math.sqrt(vx*vx + vy*vy + vz*vz)) * length
+		lz = vz / max(1e-6, math.sqrt(vx*vx + vy*vy + vz*vz)) * length
+		glVertex3f(x, y, z)
+		glVertex3f(x - lx, y - ly, z - lz)
+	glEnd()
+	# Draw splashes
+	glColor4f(0.85, 0.95, 1.0, 0.45 * celestial_fade)
+	glBegin(GL_LINES)
+	for r in raindrops:
+		if r.get("alive", True) or r.get("splash", 0.0) <= 0.0:
+			continue
+		x, y, z = r["pos"]
+		s = 0.12 * r["splash"]
+		glVertex3f(x - s, GROUND_Y + 0.02, z)
+		glVertex3f(x + s, GROUND_Y + 0.02, z)
+	glEnd()
+	glDisable(GL_BLEND)
+
+
+def draw_ufos():
+	if celestial_fade <= 0.01 or not ufos:
+		return
+	_sky_push_camera()
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+	for u in ufos:
+		x, y, z = u["pos"]
+		phase = u.get("phase", 0.0)
+		wobble = 0.12 * math.sin(phase * 2.5)
+		# Glow disc
+		glPushMatrix()
+		glTranslatef(x, y + wobble, z)
+		glColor4f(0.6, 0.9, 1.0, 0.9 * celestial_fade)
+		glBegin(GL_TRIANGLE_FAN)
+		glVertex3f(0, 0, 0)
+		for i in range(0, 26):
+			ang = (i/25.0) * 6.28318
+			r = 0.5
+			glVertex3f(math.cos(ang)*r, math.sin(ang)*r*0.45, 0)
+		glEnd()
+		# Dome
+		glColor4f(0.8, 0.95, 1.0, 0.65 * celestial_fade)
+		glPushMatrix()
+		glTranslatef(0, 0.12, 0)
+		glutSolidSphere(0.22, 12, 10)
+		glPopMatrix()
+		glPopMatrix()
+	glDisable(GL_BLEND)
+
+
+def draw_comet():
+	if celestial_fade <= 0.01 or not comets:
+		return
+	_sky_push_camera()
+	glEnable(GL_BLEND)
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE)
+	for c in comets:
+		# head
+		hx, hy, hz = c["pos"]
+		glColor4f(1.0, 0.95, 0.85, 0.95 * celestial_fade)
+		glPushMatrix()
+		glTranslatef(hx, hy, hz)
+		glutSolidSphere(comet_head_radius, 12, 10)
+		glPopMatrix()
+		# tail segments
+		for seg in c.get("tail", [])[-comet_tail_max:]:
+			px, py, pz = seg["pos"]
+			age = seg["life"]
+			alpha = max(0.0, min(1.0, age)) * 0.55 * celestial_fade
+			clr = celestial_palette["comet_tail"]
+			glColor4f(clr[0], clr[1], clr[2], alpha)
+			glPushMatrix()
+			glTranslatef(px, py, pz)
+			s = 0.10 * (0.6 + 0.4 * age)
+			glBegin(GL_QUADS)
+			glVertex3f(-s, -s, 0)
+			glVertex3f(s, -s, 0)
+			glVertex3f(s, s, 0)
+			glVertex3f(-s, s, 0)
+			glEnd()
+			glPopMatrix()
+	glDisable(GL_BLEND)
 
 
 def draw_box(scale_x, scale_y, scale_z, color=None):
@@ -772,6 +1407,19 @@ def draw_obstacles():
 			draw_cube(1.0)
 			glPopMatrix()
 			glPopMatrix()
+		elif otype == "wall":
+			# Breakable wall panel across the lane
+			glColor3f(0.75, 0.75, 0.80)
+			width = obs.get("width", 1.8)
+			height = obs.get("height", 0.9)
+			thickness = obs.get("thickness", 0.10)  # slim visual thickness
+			glPushMatrix()
+			# lift wall so its center is above the ground/ceiling a bit
+			lift = (height * 0.5 + 0.1) * (1.0 if obs.get("side", "Floor") == "Floor" else -1.0)
+			glTranslatef(0.0, lift, 0.0)
+			glScalef(width, height, thickness)
+			draw_cube(1.0)
+			glPopMatrix()
 		elif otype == "ball":
 			# Spherical obstacle (same color as cube)
 			glColor3f(0.9, 0.3, 0.3)
@@ -956,16 +1604,25 @@ def try_spawn_obstacles():
 			if target_z - closest_ahead > -(eff_min_gap):
 				target_z = closest_ahead - eff_min_gap
 		side = "Floor" if random.random() < 0.5 else "Ceiling"
-		# Choose obstacle type by mode
-		if current_difficulty_mode == "EASY":
-			otype = choose_by_weights(get_theme_def()["obstacle_weights"]) if current_theme else "cube"
-		elif current_difficulty_mode == "MEDIUM":
-			# Favor traps in medium
-			otype = choose_by_weights([("trap", 0.4)] + get_theme_def()["obstacle_weights"]) if current_theme else ("trap" if random.random() < 0.6 else "cube")
-		else:  # HARD
-			# Favor theme-specific hard obstacles
-			weights = get_theme_def()["obstacle_weights"] if current_theme else [("ball", 0.45), ("trap", 0.35), ("cube", 0.2)]
-			otype = choose_by_weights(weights)
+		# 40% chance for wall, 60% for other obstacles
+		if random.random() < 0.40:
+			otype = "wall"
+		else:
+			if current_theme:
+				otype = choose_by_weights(get_theme_def()["obstacle_weights"])  # theme-provided (no walls here)
+			else:
+				if current_difficulty_mode == "EASY":
+					otype = "cube"
+				elif current_difficulty_mode == "MEDIUM":
+					otype = "trap" if random.random() < 0.6 else "cube"
+				else:  # HARD
+					roll_other = random.random()
+					if roll_other < 0.45:
+						otype = "ball"
+					elif roll_other < 0.80:
+						otype = "trap"
+					else:
+						otype = "cube"
 		obs = {"x": LANE_X[lane], "z": target_z, "size": size, "side": side, "type": otype}
 		if otype == "ball":
 			obs["radius"] = random.uniform(0.6, 1.1)
@@ -985,11 +1642,17 @@ def try_spawn_obstacles():
 			obs["outer"] = random.uniform(0.8, 1.2)
 		elif otype == "trap":
 			obs["length"] = random.uniform(1.4, 2.2)
+		elif otype == "wall":
+			obs["width"] = random.uniform(1.6, 2.0)
+			obs["height"] = random.uniform(0.8, 1.2)
+			obs["thickness"] = random.uniform(0.18, 0.28)
 		obstacles.append(obs)
 		spawned += 1
 		# Cap spawns per frame depending on mode
 		if spawned >= spawn_cap_per_frame:
 			break
+
+	# Removed forced per-lane wall injection to target ~40% walls overall
 
 	# Guarantee a minimum number of obstacles present by topping up beyond per-frame cap
 	fill_safety = 0
@@ -1005,25 +1668,35 @@ def try_spawn_obstacles():
 			if target_z - closest_ahead > -(eff_min_gap):
 				target_z = closest_ahead - eff_min_gap
 		side = "Floor" if random.random() < 0.5 else "Ceiling"
-		# Choose obstacle type by mode (same logic as above)
-		if current_difficulty_mode == "EASY":
-			otype = "cube"
-		elif current_difficulty_mode == "MEDIUM":
-			otype = "trap" if random.random() < 0.6 else "cube"
+		# 40% walls, 60% others for top-up as well
+		if random.random() < 0.40:
+			otype = "wall"
 		else:
-			roll = random.random()
-			if roll < 0.45:
-				otype = "ball"
-			elif roll < 0.80:
-				otype = "trap"
+			if current_theme:
+				otype = choose_by_weights(get_theme_def()["obstacle_weights"])  # theme-provided (no walls here)
 			else:
-				otype = "cube"
-		obs = {"x": LANE_X[lane], "z": target_z, "size": size, "side": side, "type": otype}
+				if current_difficulty_mode == "EASY":
+					otype = "cube"
+				elif current_difficulty_mode == "MEDIUM":
+					otype = "trap" if random.random() < 0.6 else "cube"
+				else:
+					roll_other = random.random()
+					if roll_other < 0.45:
+						otype = "ball"
+					elif roll_other < 0.80:
+						otype = "trap"
+					else:
+						otype = "cube"
+		dobs = {"x": LANE_X[lane], "z": target_z, "size": size, "side": side, "type": otype}
 		if otype == "ball":
-			obs["radius"] = random.uniform(0.6, 1.1)
+			dobs["radius"] = random.uniform(0.6, 1.1)
 		elif otype == "trap":
-			obs["length"] = random.uniform(1.4, 2.2)
-		obstacles.append(obs)
+			dobs["length"] = random.uniform(1.4, 2.2)
+		elif otype == "wall":
+			dobs["width"] = random.uniform(1.6, 2.0)
+			dobs["height"] = random.uniform(0.8, 1.2)
+			dobs["thickness"] = random.uniform(0.18, 0.28)
+		obstacles.append(dobs)
 
 
 def try_spawn_platforms():
@@ -1120,6 +1793,30 @@ def display():
 	# Apply roll around Z-axis
 	glRotatef(camera_roll_deg, 0.0, 0.0, 1.0)
 
+	# Sky layer (behind gameplay): stars/moon/sun/clouds/rain/ufos
+	flags = _theme_celestial_flags()
+	if celestial_fade > 0.01:
+		# Stars first
+		if flags["stars"]:
+			draw_stars()
+		# Then sun/moon (exclusive typical)
+		if flags["sun"]:
+			draw_sun()
+		elif flags["moon"]:
+			draw_moon()
+		# Then clouds
+		if current_occasion in ('day', 'day_rain'):
+			draw_clouds()
+		# Then rain overlay
+		if current_occasion in ('day_rain', 'night_rain'):
+			draw_rain()
+		# Then comets
+		if flags["comets"]:
+			draw_comet()
+		# Then UFOs if selected
+		if current_occasion == 'ufo':
+			draw_ufos()
+
 	draw_ground_and_lanes()
 	# Draw platforms before player so player appears on top
 	for p in platforms:
@@ -1130,6 +1827,20 @@ def display():
 	for c in collectibles:
 		if c.side == current_surface:
 			c.draw()
+	# Draw bullets before player so they appear in front of scenery
+	if bullets:
+		glPushMatrix()
+		glColor3f(1.0, 0.95, 0.2)
+		for b in bullets:
+			if b.get("alive", True) and b.get("side", current_surface) == current_surface:
+				glPushMatrix()
+				yb = -0.25 if current_surface == "Floor" else 0.25
+				glTranslatef(LANE_X[b["lane"]], yb, b["z"])
+				glScalef(0.15, 0.15, 0.4)
+				draw_cube(1.0)
+				glPopMatrix()
+		glPopMatrix()
+
 	draw_player()
 	draw_obstacles()
 
@@ -1160,11 +1871,22 @@ def display():
 		else:
 			draw_text_2d(width * 0.5 - 100, height * 0.5, "Game Over - Press R to restart")
 
+	# Draw wall debris particles on top
+	if wall_debris:
+		for p in wall_debris:
+			glPushMatrix()
+			glTranslatef(p["pos"][0], p["pos"][1], p["pos"][2])
+			glColor3f(0.85, 0.85, 0.9)
+			s = p["size"]
+			glScalef(s, s, s)
+			draw_cube(1.0)
+			glPopMatrix()
+
 	glutSwapBuffers()
 
 
 def update():
-	global last_time, obstacles, score, is_game_over, high_score, camera_roll_deg, platforms, difficulty_factor, forward_speed, current_difficulty_mode, spawn_cap_per_frame, collectibles, orbs_collected, cheat_active, cheat_until_ts, revive_available, waiting_for_revive_choice
+	global last_time, obstacles, score, is_game_over, high_score, camera_roll_deg, platforms, difficulty_factor, forward_speed, current_difficulty_mode, spawn_cap_per_frame, collectibles, orbs_collected, cheat_active, cheat_until_ts, revive_available, waiting_for_revive_choice, bullets, wall_debris
 	now = time.time()
 	if last_time is None:
 		last_time = now
@@ -1188,6 +1910,8 @@ def update():
 		# Continuous factor still ramps to smooth out transitions
 		difficulty_factor = 1.0 + (score / 250.0)
 		difficulty_factor = min(difficulty_factor, 6.0)
+		# Update celestial systems (twinkle, comets, fade)
+		update_celestials(dt, now)
 		# Adjust speed and per-frame spawn cap by mode
 		if current_difficulty_mode == "EASY":
 			spawn_cap_per_frame = 1
@@ -1226,6 +1950,53 @@ def update():
 
 		# Update car fire effect particles
 		update_car_fire_effect(dt)
+
+		# Update bullets
+		if bullets:
+			for b in bullets:
+				if not b.get("alive", True):
+					continue
+				b["z"] -= bullet_speed * dt
+				if b["z"] < -200.0:
+					b["alive"] = False
+			bullets = [b for b in bullets if b.get("alive", True)]
+
+		# Bullet vs wall collision
+		if bullets and obstacles:
+			remaining_obs = []
+			for obs in obstacles:
+				otype = obs.get("type")
+				if obs.get("side", "Floor") != current_surface:
+					remaining_obs.append(obs)
+					continue
+				hit_remove_obs = False
+				for b in bullets:
+					if not b.get("alive", True):
+						continue
+					if b["lane"] != LANE_X.index(obs["x"]):
+						continue
+					if abs(b["z"] - obs["z"]) <= 0.6:
+						b["alive"] = False
+						# If wall: destroy and spawn debris; if cube/ball/drone: just stop the bullet
+						if otype == "wall":
+							spawn_wall_debris(obs["x"], (-0.25) if current_surface == "Floor" else 0.25, obs["z"])
+							hit_remove_obs = True
+						break
+				if not hit_remove_obs:
+					remaining_obs.append(obs)
+			obstacles = remaining_obs
+			bullets = [b for b in bullets if b.get("alive", True)]
+
+		# Update wall debris
+		if wall_debris:
+			gravity = 7.0 * (1.0 if current_surface == "Ceiling" else -1.0)
+			for p in wall_debris:
+				p["vel"][1] += gravity * dt
+				p["pos"][0] += p["vel"][0] * dt
+				p["pos"][1] += p["vel"][1] * dt
+				p["pos"][2] += p["vel"][2] * dt
+				p["life"] -= dt
+			wall_debris[:] = [p for p in wall_debris if p["life"] > 0]
 
 		# Step detection: if player overlaps a platform on current surface, trigger break if breakable
 		player_x = LANE_X[current_lane_index]
@@ -1309,7 +2080,7 @@ def special_keys(key, x, y):
 
 
 def keyboard(key, x, y):
-	global is_game_over, current_surface, target_roll_deg, player_z_offset, cheat_active, cheat_until_ts, orbs_collected, revive_available, waiting_for_revive_choice, current_theme, theme_selection_active
+	global is_game_over, current_surface, target_roll_deg, player_z_offset, cheat_active, cheat_until_ts, orbs_collected, revive_available, waiting_for_revive_choice, current_theme, theme_selection_active, current_occasion, bullets, _last_bullet_time
 	key = key.decode("utf-8") if isinstance(key, bytes) else key
 	if key in ("q", "Q", "\x1b"):
 		glutLeaveMainLoop() if hasattr(GLUT, 'glutLeaveMainLoop') else exit(0)
@@ -1336,6 +2107,15 @@ def keyboard(key, x, y):
 			orbs_collected -= 10
 			cheat_active = True
 			cheat_until_ts = time.time() + 3.0
+	elif key in ("f", "F") and not is_game_over:
+		# Fire bullet with simple cooldown
+		fire_bullet()
+	elif key in ("w", "W") and not is_game_over:
+		# Move forward along -Z (toward camera)
+		player_z_offset = max(player_z_min, player_z_offset - player_z_step)
+	elif key in ("s", "S") and not is_game_over:
+		# Move backward along +Z
+		player_z_offset = min(player_z_max, player_z_offset + player_z_step)
 	elif theme_selection_active and current_theme is None and not is_game_over:
 		# Theme choices: 1,2,3
 		if key == "1":
@@ -1344,16 +2124,36 @@ def keyboard(key, x, y):
 			# reseed obstacles to reflect theme immediately
 			obstacles.clear()
 			seed_initial_obstacles()
+			init_celestials_for_theme()
 		elif key == "2":
 			current_theme = 'jungle'
 			theme_selection_active = False
 			obstacles.clear()
 			seed_initial_obstacles()
+			init_celestials_for_theme()
 		elif key == "3":
 			current_theme = 'space'
 			theme_selection_active = False
 			obstacles.clear()
 			seed_initial_obstacles()
+			init_celestials_for_theme()
+	elif not is_game_over:
+		# Occasion Change Mode (keys 5–9) only changes sky layer, not ground
+		if key == "5":
+			current_occasion = 'night'
+			init_celestials_for_theme()
+		elif key == "6":
+			current_occasion = 'day'
+			init_celestials_for_theme()
+		elif key == "7":
+			current_occasion = 'night_rain'
+			init_celestials_for_theme()
+		elif key == "8":
+			current_occasion = 'day_rain'
+			init_celestials_for_theme()
+		elif key == "9":
+			current_occasion = 'ufo'
+			init_celestials_for_theme()
 	elif is_game_over and waiting_for_revive_choice:
 		# Handle revive prompts
 		if key in ("y", "Y") and revive_available and orbs_collected >= 15:
@@ -1376,10 +2176,7 @@ def keyboard(key, x, y):
 			# Decline revive; stay in game over
 			revive_available = False
 			waiting_for_revive_choice = False
-	elif key in ("w", "W") and not is_game_over:
-		player_z_offset = max(player_z_min, player_z_offset - player_z_step)
-	elif key in ("s", "S") and not is_game_over:
-		player_z_offset = min(player_z_max, player_z_offset + player_z_step)
+
 
 
 def reshape(w, h):
@@ -1455,6 +2252,11 @@ def main():
 			glutReshapeFunc(reshape)
 			glutKeyboardFunc(keyboard)
 			glutSpecialFunc(special_keys)
+			# Mouse: left-button fire
+			def _mouse(btn, state, mx, my):
+				if btn == GLUT_LEFT_BUTTON and state == GLUT_DOWN and not is_game_over:
+					fire_bullet()
+			glutMouseFunc(_mouse)
 		else:
 			# Allow quitting from selection
 			if key in ("q", "Q", "\x1b"):
